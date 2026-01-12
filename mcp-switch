@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${BASH_VERSION:-}" ]]; then
+  echo "mcp-switch: bash is required" >&2
+  exit 1
+fi
+
+CONFIG_ROOT="${MCP_SWITCH_HOME:-$HOME/.mcp-switch}"
+SERVERS_DIR="$CONFIG_ROOT/servers"
+
+die() {
+  echo "mcp-switch: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mcp-switch add <name> -- <command> [args...]
+  mcp-switch add <name> --url <url> [--bearer-token-env-var ENV]
+  mcp-switch add <name> -- <command> [args...] [--env KEY=VALUE ...]
+  mcp-switch list
+  mcp-switch remove <name>
+  mcp-switch run [--agent codex|claude] [--all|--none] [--] [agent args...]
+
+Notes:
+  - Configs are stored under ~/.mcp-switch/servers/
+  - MCP selection uses gum or fzf if available; otherwise falls back to prompts
+  - MCP_SWITCH_HOME overrides the default config directory
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$SERVERS_DIR"
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid name: $name"
+}
+
+check_no_newline() {
+  local label="$1"
+  local value="$2"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "$label must not contain newlines"
+}
+
+join_by() {
+  local delim="$1"
+  shift
+  local out=""
+  local first=1
+  local part
+  for part in "$@"; do
+    if [[ $first -eq 1 ]]; then
+      out="$part"
+      first=0
+    else
+      out+="${delim}${part}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+toml_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '%s' "$s"
+}
+
+toml_array() {
+  local out=""
+  local first=1
+  local item
+  for item in "$@"; do
+    item=$(toml_escape "$item")
+    if [[ $first -eq 1 ]]; then
+      out="\"$item\""
+      first=0
+    else
+      out+=",\"$item\""
+    fi
+  done
+  printf '[%s]' "$out"
+}
+
+toml_inline_env() {
+  local out=""
+  local first=1
+  local kv key value
+  for kv in "$@"; do
+    key=${kv%%=*}
+    value=${kv#*=}
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env key: $key"
+    value=$(toml_escape "$value")
+    if [[ $first -eq 1 ]]; then
+      out="${key}=\"${value}\""
+      first=0
+    else
+      out+=",${key}=\"${value}\""
+    fi
+  done
+  printf '{%s}' "$out"
+}
+
+tui_single_select() {
+  local items=("$@")
+  if command -v gum >/dev/null 2>&1; then
+    printf '%s\n' "${items[@]}" | gum choose
+    return $?
+  fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "${items[@]}" | fzf
+    return $?
+  fi
+
+  echo "Select one:"
+  local i=1
+  for item in "${items[@]}"; do
+    echo " [$i] $item"
+    i=$((i + 1))
+  done
+  printf "Enter number: "
+  local input
+  read -r input
+  [[ "$input" =~ ^[0-9]+$ ]] || die "invalid selection"
+  ((input >= 1 && input <= ${#items[@]})) || die "invalid selection"
+  printf '%s' "${items[$((input - 1))]}"
+}
+
+tui_multi_select() {
+  local items=("$@")
+  if command -v gum >/dev/null 2>&1; then
+    local selected=()
+    local choice
+    while true; do
+      local options=()
+      local item
+      for item in "${items[@]}"; do
+        local is_selected=0
+        local s
+        for s in "${selected[@]+${selected[@]}}"; do
+          if [[ "$s" == "$item" ]]; then
+            is_selected=1
+            break
+          fi
+        done
+        if [[ $is_selected -eq 1 ]]; then
+          options+=("[x] $item")
+        else
+          options+=("[ ] $item")
+        fi
+      done
+      options+=("Done")
+
+      choice=$(printf '%s\n' "${options[@]}" | gum choose --header "Enter to toggle, select Done to finish") || return 1
+      if [[ "$choice" == "Done" ]]; then
+        if gum confirm "Finish selection?" --default=false; then
+          break
+        fi
+        continue
+      fi
+
+      local name="$choice"
+      case "$choice" in
+        "[x] "*|"[ ] "*)
+          name="${choice:4}"
+          ;;
+      esac
+
+      local next=()
+      local found=0
+      local s
+      for s in "${selected[@]+${selected[@]}}"; do
+        if [[ "$s" == "$name" ]]; then
+          found=1
+        else
+          next+=("$s")
+        fi
+      done
+      if [[ $found -eq 0 ]]; then
+        next+=("$name")
+      fi
+      selected=(${next[@]+"${next[@]}"})
+    done
+
+    printf '%s\n' "${selected[@]+${selected[@]}}"
+    return 0
+  fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "${items[@]}" | fzf --multi
+    return $?
+  fi
+
+  if [[ ${#items[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "Select one or more (space-separated numbers, empty for none):"
+  local i=1
+  for item in "${items[@]}"; do
+    echo " [$i] $item"
+    i=$((i + 1))
+  done
+  printf "Enter numbers: "
+  local input
+  read -r input
+  [[ -z "$input" ]] && return 0
+
+  local selection=()
+  local idx
+  for idx in $input; do
+    [[ "$idx" =~ ^[0-9]+$ ]] || die "invalid selection: $idx"
+    ((idx >= 1 && idx <= ${#items[@]})) || die "invalid selection: $idx"
+    selection+=("${items[$((idx - 1))]}")
+  done
+  printf '%s\n' "${selection[@]+${selection[@]}}"
+}
+
+load_server_file() {
+  local name="$1"
+  local file="$SERVERS_DIR/$name.conf"
+  [[ -f "$file" ]] || die "server not found: $name"
+
+  local type="" command="" url="" bearer=""
+  local args=()
+  local envs=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      TYPE=*) type=${line#TYPE=} ;;
+      COMMAND=*) command=${line#COMMAND=} ;;
+      URL=*) url=${line#URL=} ;;
+      BEARER_TOKEN_ENV_VAR=*) bearer=${line#BEARER_TOKEN_ENV_VAR=} ;;
+      ARG=*) args+=("${line#ARG=}") ;;
+      ENV=*) envs+=("${line#ENV=}") ;;
+      *) ;;
+    esac
+  done < "$file"
+
+  [[ -n "$type" ]] || die "invalid server file (missing TYPE): $file"
+
+  if [[ "$type" == "stdio" ]]; then
+    [[ -n "$command" ]] || die "invalid server file (missing COMMAND): $file"
+    local parts=()
+    parts+=("command=\"$(toml_escape "$command")\"")
+    if [[ ${#args[@]} -gt 0 ]]; then
+      parts+=("args=$(toml_array "${args[@]}")")
+    fi
+    if [[ ${envs+set} == set && ${#envs[@]} -gt 0 ]]; then
+      parts+=("env=$(toml_inline_env "${envs[@]}")")
+    fi
+    printf '{%s}' "$(join_by ',' "${parts[@]}")"
+    return 0
+  fi
+
+  if [[ "$type" == "http" ]]; then
+    [[ -n "$url" ]] || die "invalid server file (missing URL): $file"
+    local parts=()
+    parts+=("url=\"$(toml_escape "$url")\"")
+    if [[ -n "$bearer" ]]; then
+      parts+=("bearer_token_env_var=\"$(toml_escape "$bearer")\"")
+    fi
+    printf '{%s}' "$(join_by ',' "${parts[@]}")"
+    return 0
+  fi
+
+  die "invalid server TYPE in $file: $type"
+}
+
+list_servers() {
+  ensure_dirs
+  local servers=()
+  local file
+  shopt -s nullglob
+  for file in "$SERVERS_DIR"/*.conf; do
+    servers+=("${file##*/}")
+  done
+  shopt -u nullglob
+  if [[ ${#servers[@]} -eq 0 ]]; then
+    return 0
+  fi
+  local name
+  for name in "${servers[@]}"; do
+    printf '%s\n' "${name%.conf}"
+  done
+}
+
+cmd_add() {
+  [[ $# -ge 1 ]] || die "name required"
+  local name="$1"
+  shift
+  validate_name "$name"
+  ensure_dirs
+
+  local url=""
+  local bearer=""
+  local command=""
+  local args=()
+  local envs=()
+  local has_command=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url)
+        [[ $# -ge 2 ]] || die "--url requires a value"
+        url="$2"
+        check_no_newline "url" "$url"
+        shift 2
+        ;;
+      --bearer-token-env-var)
+        [[ $# -ge 2 ]] || die "--bearer-token-env-var requires a value"
+        bearer="$2"
+        check_no_newline "bearer-token-env-var" "$bearer"
+        shift 2
+        ;;
+      --env)
+        [[ $# -ge 2 ]] || die "--env requires KEY=VALUE"
+        envs+=("$2")
+        check_no_newline "env" "$2"
+        shift 2
+        ;;
+      --)
+        shift
+        [[ $# -ge 1 ]] || die "command required after --"
+        command="$1"
+        check_no_newline "command" "$command"
+        shift
+        args=("$@")
+        has_command=1
+        break
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+
+  if [[ -n "$url" && $has_command -eq 1 ]]; then
+    die "use --url or command, not both"
+  fi
+  if [[ -z "$url" && $has_command -eq 0 ]]; then
+    die "command required (use --url for http servers)"
+  fi
+  if [[ -n "$url" && ${envs+set} == set && ${#envs[@]} -gt 0 ]]; then
+    die "--env is only valid for stdio servers"
+  fi
+
+  local file="$SERVERS_DIR/$name.conf"
+  [[ -e "$file" ]] && die "server already exists: $name"
+
+  if [[ -n "$url" ]]; then
+    {
+      echo "TYPE=http"
+      echo "URL=$url"
+      if [[ -n "$bearer" ]]; then
+        echo "BEARER_TOKEN_ENV_VAR=$bearer"
+      fi
+    } > "$file"
+    return 0
+  fi
+
+  {
+    echo "TYPE=stdio"
+    echo "COMMAND=$command"
+    if [[ ${#args[@]} -gt 0 ]]; then
+      local arg
+      for arg in "${args[@]}"; do
+        check_no_newline "arg" "$arg"
+        echo "ARG=$arg"
+      done
+    fi
+    if [[ ${envs+set} == set && ${#envs[@]} -gt 0 ]]; then
+      local env
+      for env in "${envs[@]}"; do
+        echo "ENV=$env"
+      done
+    fi
+  } > "$file"
+}
+
+cmd_list() {
+  local servers
+  servers=$(list_servers)
+  if [[ -z "$servers" ]]; then
+    echo "no servers"
+    return 0
+  fi
+  printf '%s\n' "$servers"
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "name required"
+  local name="$1"
+  validate_name "$name"
+  local file="$SERVERS_DIR/$name.conf"
+  [[ -f "$file" ]] || die "server not found: $name"
+  rm -f "$file"
+}
+
+build_mcp_override() {
+  local selected=("$@")
+  if [[ ${#selected[@]} -eq 0 ]]; then
+    printf '{}'
+    return 0
+  fi
+  local pairs=()
+  local name inline
+  for name in "${selected[@]}"; do
+    inline=$(load_server_file "$name")
+    pairs+=("${name}=${inline}")
+  done
+  printf '{%s}' "$(join_by ',' "${pairs[@]}")"
+}
+
+run_codex() {
+  local override="$1"
+  shift
+  local cmd=(codex)
+  cmd+=(-c "mcp_servers=$override")
+  cmd+=("$@")
+  "${cmd[@]}"
+}
+
+run_claude() {
+  die "claude support is not implemented yet"
+}
+
+cmd_run() {
+  local agent=""
+  local select_all=0
+  local select_none=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agent)
+        [[ $# -ge 2 ]] || die "--agent requires a value"
+        agent="$2"
+        shift 2
+        ;;
+      --all)
+        select_all=1
+        shift
+        ;;
+      --none)
+        select_none=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [[ -z "$agent" && $# -gt 0 ]]; then
+    if [[ "$1" == "codex" || "$1" == "claude" ]]; then
+      agent="$1"
+      shift
+    fi
+  fi
+
+  if [[ -z "$agent" ]]; then
+    agent=$(tui_single_select "codex" "claude") || die "agent selection canceled"
+  fi
+
+  local servers=()
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && servers+=("$name")
+  done < <(list_servers)
+
+  local selected=()
+  if [[ $select_all -eq 1 && $select_none -eq 1 ]]; then
+    die "--all and --none are mutually exclusive"
+  fi
+  if [[ $select_all -eq 1 ]]; then
+    if [[ ${#servers[@]} -gt 0 ]]; then
+      selected=("${servers[@]}")
+    else
+      selected=()
+    fi
+  elif [[ $select_none -eq 1 ]]; then
+    selected=()
+  else
+    local selection=""
+    if [[ ${#servers[@]} -gt 0 ]]; then
+      selection=$(tui_multi_select "${servers[@]}") || die "mcp selection canceled"
+    fi
+    if [[ -n "$selection" ]]; then
+      local line
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && selected+=("$line")
+      done <<<"$selection"
+    fi
+  fi
+
+  local override
+  if [[ ${#selected[@]} -gt 0 ]]; then
+    override=$(build_mcp_override "${selected[@]}")
+  else
+    override=$(build_mcp_override)
+  fi
+
+  case "$agent" in
+    codex) run_codex "$override" "$@" ;;
+    claude) run_claude ;;
+    *) die "unknown agent: $agent" ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    add)
+      shift
+      cmd_add "$@"
+      ;;
+    list)
+      shift
+      cmd_list "$@"
+      ;;
+    remove|rm)
+      shift
+      cmd_remove "$@"
+      ;;
+    run|"")
+      if [[ "$cmd" == "run" ]]; then
+        shift
+      fi
+      cmd_run "$@"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "unknown command: $cmd (use --help)"
+      ;;
+  esac
+}
+
+main "$@"
