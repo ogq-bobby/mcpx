@@ -88,6 +88,51 @@ toml_array() {
   printf '[%s]' "$out"
 }
 
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+json_array() {
+  local out=""
+  local first=1
+  local item
+  for item in "$@"; do
+    item=$(json_escape "$item")
+    if [[ $first -eq 1 ]]; then
+      out="\"$item\""
+      first=0
+    else
+      out+=",\"$item\""
+    fi
+  done
+  printf '[%s]' "$out"
+}
+
+json_inline_env() {
+  local out=""
+  local first=1
+  local kv key value
+  for kv in "$@"; do
+    key=${kv%%=*}
+    value=${kv#*=}
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env key: $key"
+    value=$(json_escape "$value")
+    if [[ $first -eq 1 ]]; then
+      out="\"${key}\":\"${value}\""
+      first=0
+    else
+      out+=",\"${key}\":\"${value}\""
+    fi
+  done
+  printf '{%s}' "$out"
+}
+
 toml_inline_env() {
   local out=""
   local first=1
@@ -272,6 +317,59 @@ load_server_file() {
   die "invalid server TYPE in $file: $type"
 }
 
+load_server_json() {
+  local name="$1"
+  local file="$SERVERS_DIR/$name.conf"
+  [[ -f "$file" ]] || die "server not found: $name"
+
+  local type="" command="" url="" bearer=""
+  local args=()
+  local envs=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      TYPE=*) type=${line#TYPE=} ;;
+      COMMAND=*) command=${line#COMMAND=} ;;
+      URL=*) url=${line#URL=} ;;
+      BEARER_TOKEN_ENV_VAR=*) bearer=${line#BEARER_TOKEN_ENV_VAR=} ;;
+      ARG=*) args+=("${line#ARG=}") ;;
+      ENV=*) envs+=("${line#ENV=}") ;;
+      *) ;;
+    esac
+  done < "$file"
+
+  [[ -n "$type" ]] || die "invalid server file (missing TYPE): $file"
+
+  if [[ "$type" == "stdio" ]]; then
+    [[ -n "$command" ]] || die "invalid server file (missing COMMAND): $file"
+    local parts=()
+    parts+=("\"command\":\"$(json_escape "$command")\"")
+    if [[ ${#args[@]} -gt 0 ]]; then
+      parts+=("\"args\":$(json_array "${args[@]}")")
+    fi
+    if [[ ${envs+set} == set && ${#envs[@]} -gt 0 ]]; then
+      parts+=("\"env\":$(json_inline_env "${envs[@]}")")
+    fi
+    printf '{%s}' "$(join_by ',' "${parts[@]}")"
+    return 0
+  fi
+
+  if [[ "$type" == "http" ]]; then
+    [[ -n "$url" ]] || die "invalid server file (missing URL): $file"
+    local parts=()
+    parts+=("\"url\":\"$(json_escape "$url")\"")
+    parts+=("\"transport\":\"http\"")
+    if [[ -n "$bearer" ]]; then
+      echo "mcp-switch: warning: bearer token env var ignored for claude (${name})" >&2
+    fi
+    printf '{%s}' "$(join_by ',' "${parts[@]}")"
+    return 0
+  fi
+
+  die "invalid server TYPE in $file: $type"
+}
+
 list_servers() {
   ensure_dirs
   local servers=()
@@ -421,6 +519,19 @@ build_mcp_override() {
   printf '{%s}' "$(join_by ',' "${pairs[@]}")"
 }
 
+build_claude_config() {
+  local selected=("$@")
+  local pairs=()
+  local name inline
+  if [[ ${#selected[@]} -gt 0 ]]; then
+    for name in "${selected[@]}"; do
+      inline=$(load_server_json "$name")
+      pairs+=("\"$(json_escape "$name")\":${inline}")
+    done
+  fi
+  printf '{"mcpServers":{%s}}' "$(join_by ',' ${pairs[@]+"${pairs[@]}"})"
+}
+
 run_codex() {
   local override="$1"
   shift
@@ -431,7 +542,18 @@ run_codex() {
 }
 
 run_claude() {
-  die "claude support is not implemented yet"
+  local config_json="$1"
+  shift
+  command -v claude >/dev/null 2>&1 || die "claude is not installed"
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/mcp-switch-claude.XXXXXX.json") || die "failed to create temp file"
+  printf '%s' "$config_json" > "$tmp"
+  local cmd=(claude --mcp-config "$tmp" --strict-mcp-config)
+  cmd+=("$@")
+  local status=0
+  "${cmd[@]}" || status=$?
+  rm -f "$tmp"
+  return $status
 }
 
 cmd_run() {
@@ -510,16 +632,25 @@ cmd_run() {
     fi
   fi
 
-  local override
-  if [[ ${#selected[@]} -gt 0 ]]; then
-    override=$(build_mcp_override "${selected[@]}")
-  else
-    override=$(build_mcp_override)
-  fi
-
   case "$agent" in
-    codex) run_codex "$override" "$@" ;;
-    claude) run_claude ;;
+    codex)
+      local override
+      if [[ ${#selected[@]} -gt 0 ]]; then
+        override=$(build_mcp_override "${selected[@]}")
+      else
+        override=$(build_mcp_override)
+      fi
+      run_codex "$override" "$@"
+      ;;
+    claude)
+      local config_json
+      if [[ ${#selected[@]} -gt 0 ]]; then
+        config_json=$(build_claude_config "${selected[@]}")
+      else
+        config_json=$(build_claude_config)
+      fi
+      run_claude "$config_json" "$@"
+      ;;
     *) die "unknown agent: $agent" ;;
   esac
 }
