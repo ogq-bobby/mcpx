@@ -11,9 +11,9 @@ warn() {
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-src="$script_dir/mcp-switch"
+src="$script_dir/mcpx"
 
-[[ -f "$src" ]] || die "mcp-switch not found at $src"
+[[ -f "$src" ]] || die "mcpx not found at $src"
 
 choose_bindir() {
   local d
@@ -39,7 +39,7 @@ install_tui() {
     if brew install fzf >/dev/null; then
       return 0
     fi
-    warn "Failed to install gum/fzf; mcp-switch will fall back to prompts."
+    warn "Failed to install gum/fzf; mcpx will fall back to prompts."
     return 0
   fi
   warn "gum/fzf not found and Homebrew is not installed."
@@ -49,14 +49,14 @@ install_tui() {
 bindir="$(choose_bindir)"
 mkdir -p "$bindir"
 
-cp "$src" "$bindir/mcp-switch"
-chmod +x "$bindir/mcp-switch"
+cp "$src" "$bindir/mcpx"
+chmod +x "$bindir/mcpx"
 
 install_tui
 
-echo "Installed mcp-switch to $bindir/mcp-switch"
+echo "Installed mcpx to $bindir/mcpx"
 
 if ! echo ":$PATH:" | grep -q ":$bindir:"; then
-  echo "Add $bindir to PATH to use mcp-switch globally."
+  echo "Add $bindir to PATH to use mcpx globally."
   echo "Example: echo 'export PATH=\"$bindir:\$PATH\"' >> ~/.zshrc"
 fi

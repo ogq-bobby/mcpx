@@ -2,32 +2,32 @@
 set -euo pipefail
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
-  echo "mcp-switch: bash is required" >&2
+  echo "mcpx: bash is required" >&2
   exit 1
 fi
 
-CONFIG_ROOT="${MCP_SWITCH_HOME:-$HOME/.mcp-switch}"
+CONFIG_ROOT="${MCPX_HOME:-$HOME/.mcpx}"
 SERVERS_DIR="$CONFIG_ROOT/servers"
 
 die() {
-  echo "mcp-switch: $*" >&2
+  echo "mcpx: $*" >&2
   exit 1
 }
 
 usage() {
   cat <<'EOF'
 Usage:
-  mcp-switch add <name> -- <command> [args...]
-  mcp-switch add <name> --url <url> [--bearer-token-env-var ENV]
-  mcp-switch add <name> -- <command> [args...] [--env KEY=VALUE ...]
-  mcp-switch list
-  mcp-switch remove <name>
-  mcp-switch run [--agent codex|claude] [--all|--none] [--] [agent args...]
+  mcpx add <name> -- <command> [args...]
+  mcpx add <name> --url <url> [--bearer-token-env-var ENV]
+  mcpx add <name> -- <command> [args...] [--env KEY=VALUE ...]
+  mcpx list
+  mcpx remove <name>
+  mcpx run [--agent codex|claude] [--all|--none] [--] [agent args...]
 
 Notes:
-  - Configs are stored under ~/.mcp-switch/servers/
+  - Configs are stored under ~/.mcpx/servers/
   - MCP selection uses gum or fzf if available; otherwise falls back to prompts
-  - MCP_SWITCH_HOME overrides the default config directory
+  - MCPX_HOME overrides the default config directory
 EOF
 }
 
@@ -361,7 +361,7 @@ load_server_json() {
     parts+=("\"url\":\"$(json_escape "$url")\"")
     parts+=("\"transport\":\"http\"")
     if [[ -n "$bearer" ]]; then
-      echo "mcp-switch: warning: bearer token env var ignored for claude (${name})" >&2
+      echo "mcpx: warning: bearer token env var ignored for claude (${name})" >&2
     fi
     printf '{%s}' "$(join_by ',' "${parts[@]}")"
     return 0
@@ -546,7 +546,7 @@ run_claude() {
   shift
   command -v claude >/dev/null 2>&1 || die "claude is not installed"
   local tmp
-  tmp=$(mktemp "${TMPDIR:-/tmp}/mcp-switch-claude.XXXXXX.json") || die "failed to create temp file"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/mcpx-claude.XXXXXX.json") || die "failed to create temp file"
   printf '%s' "$config_json" > "$tmp"
   local cmd=(claude --mcp-config "$tmp" --strict-mcp-config)
   cmd+=("$@")
