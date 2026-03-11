@@ -2,6 +2,9 @@ name: "Claude Code Review"
 on:
   pull_request:
     types: [opened, reopened, synchronize]
+    branches:
+      - main
+    types: [opened, reopened, synchronize]
 jobs:
 jobs:
   review:
