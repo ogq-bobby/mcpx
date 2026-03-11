@@ -3,7 +3,12 @@ on:
   pull_request:
     types: [opened, reopened, synchronize]
 jobs:
+jobs:
   review:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     permissions:
       contents: read
