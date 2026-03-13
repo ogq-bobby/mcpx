@@ -3,10 +3,11 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, labeled]
 
 jobs:
   review:
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'claude-review') }}
     runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
